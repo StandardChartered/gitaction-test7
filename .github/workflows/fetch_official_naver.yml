@@ -1,0 +1,71 @@
+name: Fetch creator-linked official Naver material
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/fetch_official_naver.yml'
+      - 'tools/capture_naver_material.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      BLOG_ID: gongbupig
+      BLOG_LOG_NO: '223836639345'
+    steps:
+      - name: Check out extraction branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Chromium capture dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-cjk xvfb xauth
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade playwright requests pillow
+          python -m playwright install --with-deps chromium
+
+      - name: Capture post, public attachments, and source images
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out/official_naver out/diagnostics
+          xvfb-run -a python tools/capture_naver_material.py \
+            --blog-id "$BLOG_ID" \
+            --log-no "$BLOG_LOG_NO" \
+            --output out/official_naver \
+            2>&1 | tee out/diagnostics/naver-capture.log
+          cat out/official_naver/summary.json || true
+
+      - name: Build inventory and checksums
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out/diagnostics
+          find out -type f -printf '%P\t%s bytes\n' | sort > out/ASSET_INVENTORY.txt
+          find out -type f -print0 | sort -z | xargs -0 sha256sum > out/SHA256SUMS.txt
+          du -ah out | sort -h | tail -n 120 > out/diagnostics/largest-files.txt
+
+      - name: Upload official material capture
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: creator-official-naver-material
+          path: out
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 1
