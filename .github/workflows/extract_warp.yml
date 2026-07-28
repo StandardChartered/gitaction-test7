@@ -1,0 +1,357 @@
+name: Extract lecture through Cloudflare WARP egress
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/extract_warp.yml'
+      - 'tools/capture_youtube_browser_session.py'
+      - 'tools/normalize_captions.py'
+      - 'tools/extract_video_assets.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      VIDEO_ID: qg-_EVPqizM
+      VIDEO_URL: https://www.youtube.com/watch?v=qg-_EVPqizM
+    steps:
+      - name: Check out extraction branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Cloudflare WARP, Chromium, yt-dlp, and media tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            curl ca-certificates gnupg lsb-release ffmpeg jq fonts-noto-cjk \
+            xvfb xauth netcat-openbsd
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+            | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt-get update
+          sudo apt-get install -y cloudflare-warp
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade \
+            "yt-dlp[default,curl-cffi]" \
+            bgutil-ytdlp-pot-provider \
+            yt-dlp-getpot-wpc \
+            playwright \
+            pillow imagehash numpy
+          python -m playwright install --with-deps chromium
+          python - <<'PY' > browser-path.txt
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as p:
+              print(p.chromium.executable_path)
+          PY
+          BROWSER="$(cat browser-path.txt)"
+          test -x "$BROWSER"
+          yt-dlp --version
+          warp-cli --version || true
+
+      - name: Establish WARP tunnel and verify changed egress
+        id: warp
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uxo pipefail
+          mkdir -p out/diagnostics work
+          curl -4 --max-time 20 -fsS https://www.cloudflare.com/cdn-cgi/trace \
+            | tee out/diagnostics/trace-before-warp.txt || true
+          curl -4 --max-time 20 -fsS https://api.ipify.org \
+            | tee out/diagnostics/ip-before-warp.txt || true
+          echo >> out/diagnostics/ip-before-warp.txt
+
+          sudo systemctl enable --now warp-svc || true
+          sleep 3
+          sudo systemctl status warp-svc --no-pager > out/diagnostics/warp-service-status.txt 2>&1 || true
+          warp-cli --accept-tos registration delete > out/diagnostics/warp-registration-delete.txt 2>&1 || true
+          timeout 60s warp-cli --accept-tos registration new \
+            > out/diagnostics/warp-registration-new.txt 2>&1 \
+            || timeout 60s warp-cli --accept-tos register \
+              >> out/diagnostics/warp-registration-new.txt 2>&1 || true
+          warp-cli --accept-tos tunnel protocol set WireGuard \
+            > out/diagnostics/warp-protocol.txt 2>&1 || true
+          warp-cli --accept-tos mode warp+doh \
+            > out/diagnostics/warp-mode.txt 2>&1 || true
+          timeout 60s warp-cli --accept-tos connect \
+            > out/diagnostics/warp-connect.txt 2>&1 || true
+
+          connected=0
+          for attempt in $(seq 1 45); do
+            trace="$(curl -4 --max-time 15 -fsS https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+            printf '%s\n' "$trace" > out/diagnostics/trace-after-warp.txt
+            if grep -q '^warp=on$' out/diagnostics/trace-after-warp.txt; then
+              connected=1
+              break
+            fi
+            sleep 2
+          done
+          warp-cli --accept-tos status > out/diagnostics/warp-status.txt 2>&1 || true
+          curl -4 --max-time 20 -fsS https://api.ipify.org \
+            | tee out/diagnostics/ip-after-warp.txt || true
+          echo >> out/diagnostics/ip-after-warp.txt
+          if [[ "$connected" != 1 ]]; then
+            echo 'Cloudflare WARP did not report warp=on.' >&2
+            exit 1
+          fi
+          cat out/diagnostics/trace-after-warp.txt
+
+      - name: Build a fresh same-WARP-IP anonymous browser session
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out/browser out/diagnostics work
+          xvfb-run -a python tools/capture_youtube_browser_session.py \
+            --video-id "$VIDEO_ID" \
+            --output out/browser \
+            2>&1 | tee out/diagnostics/warp-browser-session.log
+          # Netscape cookie files represent session cookies with expiry 0, not -1.
+          sed -i $'s/\t-1\t/\t0\t/g' out/browser/youtube_cookies.txt 2>/dev/null || true
+          cat out/browser/session_summary.json || true
+
+      - name: Start local proof-of-origin token provider
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull brainicism/bgutil-ytdlp-pot-provider:latest
+          docker rm -f bgutil-provider 2>/dev/null || true
+          docker run --name bgutil-provider --detach --init --network host \
+            brainicism/bgutil-ytdlp-pot-provider:latest
+          for attempt in $(seq 1 45); do
+            nc -z 127.0.0.1 4416 && break
+            sleep 2
+          done
+          nc -z 127.0.0.1 4416
+          docker logs bgutil-provider | tee out/diagnostics/bgutil-startup.log || true
+
+      - name: Download complete lecture and caption tracks over WARP
+        id: download
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p work out/source out/diagnostics
+          COOKIE_FILE="out/browser/youtube_cookies.txt"
+          VISITOR="$(cat out/browser/visitor_data.txt 2>/dev/null || true)"
+          BROWSER="$(command -v google-chrome || command -v chromium || cat browser-path.txt)"
+          : > out/diagnostics/warp-download-attempts.log
+          success=0
+
+          run_attempt() {
+            local label="$1"
+            local client="$2"
+            local use_cookies="$3"
+            local skip="$4"
+            rm -f work/lecture.*
+            local youtube_args="player_client=${client};fetch_pot=always"
+            if [[ -n "$VISITOR" ]]; then
+              youtube_args="${youtube_args};visitor_data=${VISITOR}"
+            fi
+            if [[ "$skip" == "yes" ]]; then
+              youtube_args="${youtube_args};player_skip=webpage,configs"
+            fi
+            local cookies=()
+            if [[ "$use_cookies" == "yes" && -s "$COOKIE_FILE" ]]; then
+              cookies=(--cookies "$COOKIE_FILE")
+            fi
+            echo "===== ${label}: client=${client} cookies=${use_cookies} skip=${skip} =====" \
+              | tee -a out/diagnostics/warp-download-attempts.log
+            xvfb-run -a yt-dlp \
+              --no-playlist \
+              --verbose \
+              --js-runtimes node \
+              --remote-components ejs:github \
+              --impersonate chrome \
+              --retries 15 \
+              --fragment-retries 15 \
+              --retry-sleep 'fragment:exp=1:25' \
+              --socket-timeout 45 \
+              --concurrent-fragments 6 \
+              --no-part \
+              "${cookies[@]}" \
+              --extractor-args "youtube:${youtube_args}" \
+              --extractor-args "youtubepot-wpc:browser_path=${BROWSER}" \
+              --write-info-json --write-description --write-thumbnail --convert-thumbnails jpg \
+              --write-subs --write-auto-subs --sub-langs 'ko.*,ko,en.*' --sub-format 'json3/vtt/best' \
+              -f 'bv*[height<=720]+ba/b[height<=720]/best' \
+              --merge-output-format mkv \
+              -o 'work/lecture.%(ext)s' \
+              -P 'subtitle:out/source' \
+              -P 'thumbnail:out/source' \
+              -P 'description:out/source' \
+              -P 'infojson:out/source' \
+              "$VIDEO_URL" \
+              >> out/diagnostics/warp-download-attempts.log 2>&1
+          }
+
+          attempts=(
+            'mweb-warp-guest|mweb|yes|yes'
+            'web-safari-warp-guest|web_safari|yes|no'
+            'web-warp-guest|web|yes|yes'
+            'android-vr-warp|android_vr|no|no'
+            'web-embedded-warp|web_embedded|no|no'
+            'tv-warp-guest|tv|yes|no'
+          )
+          for attempt in "${attempts[@]}"; do
+            IFS='|' read -r label client use_cookies skip <<< "$attempt"
+            if run_attempt "$label" "$client" "$use_cookies" "$skip"; then
+              VIDEO_FILE="$(find work -maxdepth 1 -type f -name 'lecture.*' ! -name '*.json' ! -name '*.part' | head -n 1)"
+              if [[ -n "$VIDEO_FILE" && -s "$VIDEO_FILE" ]]; then
+                success=1
+                printf '%s\n' "$label" > out/source/successful_strategy.txt
+                break
+              fi
+            fi
+          done
+
+          docker logs bgutil-provider > out/diagnostics/bgutil-provider-final.log 2>&1 || true
+          if [[ "$success" != 1 ]]; then
+            echo 'Every WARP yt-dlp strategy failed to create a video file.' >&2
+            exit 1
+          fi
+          VIDEO_FILE="$(find work -maxdepth 1 -type f -name 'lecture.*' ! -name '*.json' ! -name '*.part' | head -n 1)"
+          printf '%s\n' "$VIDEO_FILE" > work/video-path.txt
+          ffprobe -v error -show_format -show_streams -of json "$VIDEO_FILE" > out/source/ffprobe.json
+          ls -lh "$VIDEO_FILE" | tee out/diagnostics/video-file.txt
+
+      - name: Extract every visually distinct lecture state
+        shell: bash
+        run: |
+          set -euxo pipefail
+          VIDEO_FILE="$(cat work/video-path.txt)"
+          python tools/extract_video_assets.py "$VIDEO_FILE" out/frames \
+            --sample-fps 2.0 \
+            --phash-threshold 9 \
+            --mad-threshold 0.026 \
+            --periodic-seconds 30 \
+            2>&1 | tee out/diagnostics/warp-frame-extraction.log
+
+      - name: Normalize caption tracks
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out/transcript out/combined-captions
+          find out/source out/browser -type f \
+            \( -iname '*.json3' -o -iname '*.vtt' -o -iname '*.srt' -o -iname '*.xml' \) \
+            -exec cp -f {} out/combined-captions/ \; 2>/dev/null || true
+          python tools/normalize_captions.py out/combined-captions out/transcript \
+            2>&1 | tee out/diagnostics/warp-caption-normalization.log
+
+      - name: Speech-recognition fallback when YouTube captions are absent
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [[ -s out/transcript/caption_segments.json ]]; then
+            echo 'A caption track is already available.'
+            exit 0
+          fi
+          python -m pip install --upgrade faster-whisper
+          VIDEO_FILE="$(cat work/video-path.txt)"
+          ffmpeg -hide_banner -loglevel warning -y -i "$VIDEO_FILE" -vn -ac 1 -ar 16000 work/audio.wav
+          timeout 95m python - <<'PY'
+          from __future__ import annotations
+          import json
+          from pathlib import Path
+          from faster_whisper import WhisperModel
+
+          output = Path('out/transcript')
+          output.mkdir(parents=True, exist_ok=True)
+          model = WhisperModel('base', device='cpu', compute_type='int8', cpu_threads=4)
+          iterator, info = model.transcribe(
+              'work/audio.wav', language='ko', beam_size=3,
+              vad_filter=True, condition_on_previous_text=True,
+          )
+          records = []
+          srt = []
+          def ts(value: float) -> str:
+              ms = int(round(value * 1000))
+              h, rem = divmod(ms, 3_600_000)
+              m, rem = divmod(rem, 60_000)
+              s, ms = divmod(rem, 1000)
+              return f'{h:02d}:{m:02d}:{s:02d},{ms:03d}'
+          for index, segment in enumerate(iterator, 1):
+              text = segment.text.strip()
+              if not text:
+                  continue
+              record = {'start': round(segment.start, 3), 'end': round(segment.end, 3), 'text': text}
+              records.append(record)
+              srt.extend([str(index), f'{ts(segment.start)} --> {ts(segment.end)}', text, ''])
+          (output / 'whisper_segments.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (output / 'whisper_transcript.srt').write_text('\n'.join(srt), encoding='utf-8')
+          (output / 'whisper_plain.txt').write_text('\n'.join(r['text'] for r in records), encoding='utf-8')
+          (output / 'whisper_info.json').write_text(json.dumps({
+              'model': 'base', 'language': info.language,
+              'language_probability': info.language_probability,
+              'segments': len(records),
+          }, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+
+      - name: Disconnect WARP before artifact upload
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set +e
+          warp-cli --accept-tos disconnect > out/diagnostics/warp-disconnect.txt 2>&1
+          sleep 3
+          curl -4 --max-time 20 -fsS https://www.cloudflare.com/cdn-cgi/trace \
+            > out/diagnostics/trace-after-disconnect.txt 2>&1
+          exit 0
+
+      - name: Build inventories and checksums
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out/diagnostics
+          find out -type f -printf '%P\t%s bytes\n' | sort > out/ASSET_INVENTORY.txt
+          find out -type f -print0 | sort -z | xargs -0 sha256sum > out/SHA256SUMS.txt
+          du -ah out | sort -h | tail -n 150 > out/diagnostics/largest-files.txt
+          cat out/frames/summary.json 2>/dev/null || true
+          cat out/transcript/caption_candidates.json 2>/dev/null || true
+
+      - name: Upload complete visual frame corpus
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: lecture-warp-frames-qg-evpqizm
+          path: |
+            out/frames
+            out/source/ffprobe.json
+            out/source/successful_strategy.txt
+            out/ASSET_INVENTORY.txt
+            out/SHA256SUMS.txt
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 1
+
+      - name: Upload transcript, source metadata, browser evidence, and diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: lecture-warp-text-qg-evpqizm
+          path: |
+            out/source
+            out/transcript
+            out/browser
+            out/diagnostics
+            out/ASSET_INVENTORY.txt
+            out/SHA256SUMS.txt
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 1
