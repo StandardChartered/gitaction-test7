@@ -1,0 +1,302 @@
+name: Extract lecture through privacy frontend
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/extract_proxy.yml'
+      - 'tools/fetch_via_frontends.py'
+      - 'tools/normalize_captions.py'
+      - 'tools/extract_video_assets.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      VIDEO_ID: qg-_EVPqizM
+      BLOG_ID: gongbupig
+      BLOG_LOG_NO: '223836639345'
+    steps:
+      - name: Check out extraction branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install extraction dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg jq fonts-noto-cjk
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade pillow imagehash numpy requests beautifulsoup4 lxml
+          ffmpeg -version | head -n 3
+
+      - name: Fetch proxied lecture streams and captions
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p work out/source out/diagnostics
+          python tools/fetch_via_frontends.py \
+            --video-id "$VIDEO_ID" \
+            --work-dir work \
+            --source-dir out/source \
+            --max-height 720 \
+            2>&1 | tee out/diagnostics/frontend-fetch.log
+          VIDEO_FILE="$(find work -maxdepth 1 -type f -name 'lecture.*' ! -name '*.part' | head -n 1)"
+          test -n "$VIDEO_FILE"
+          printf '%s\n' "$VIDEO_FILE" > work/video-path.txt
+          ffprobe -v error -show_format -show_streams -of json "$VIDEO_FILE" > out/source/ffprobe.json
+          ls -lh "$VIDEO_FILE" | tee out/diagnostics/video-file.txt
+
+      - name: Fetch the creator-linked public Naver post and attachments
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import html
+          import json
+          import os
+          import re
+          from pathlib import Path
+          from urllib.parse import unquote, urljoin, urlparse
+          import requests
+          from bs4 import BeautifulSoup
+
+          blog_id = os.environ['BLOG_ID']
+          log_no = os.environ['BLOG_LOG_NO']
+          output = Path('out/official_blog')
+          output.mkdir(parents=True, exist_ok=True)
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                            '(KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+              'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.6,en;q=0.5',
+          })
+          pages = [
+              f'https://blog.naver.com/{blog_id}/{log_no}',
+              f'https://blog.naver.com/PostView.naver?blogId={blog_id}&logNo={log_no}',
+              f'https://m.blog.naver.com/PostView.naver?blogId={blog_id}&logNo={log_no}',
+              f'https://m.blog.naver.com/{blog_id}/{log_no}',
+              f'https://rss.blog.naver.com/{blog_id}.xml',
+          ]
+          candidates: set[str] = set()
+          fetch_log = []
+          url_pattern = re.compile(r'https?(?::|%3A)(?:\\?/\\?/|%2F%2F)[^\"\'<>\\s]+', re.I)
+
+          for index, url in enumerate(pages, 1):
+              try:
+                  response = session.get(url, timeout=35, allow_redirects=True)
+                  response.raise_for_status()
+                  suffix = '.xml' if 'rss.' in url else '.html'
+                  path = output / f'page_{index}{suffix}'
+                  path.write_bytes(response.content)
+                  text = response.text
+                  decoded = html.unescape(text).replace('\\u0026', '&').replace('\\/', '/')
+                  for _ in range(3):
+                      decoded = unquote(decoded)
+                  soup = BeautifulSoup(text, 'lxml')
+                  for tag in soup.find_all(True):
+                      for key in ('href', 'src', 'data-src', 'data-link', 'data-url', 'data-attachment-url'):
+                          value = tag.get(key)
+                          if value:
+                              candidates.add(urljoin(response.url, html.unescape(value)))
+                  for match in url_pattern.findall(decoded):
+                      candidates.add(match.replace('\\/', '/'))
+                  fetch_log.append({'url': url, 'status': response.status_code, 'final_url': response.url, 'bytes': len(response.content)})
+              except Exception as exc:
+                  fetch_log.append({'url': url, 'error': repr(exc)})
+
+          cleaned: set[str] = set()
+          for candidate in candidates:
+              candidate = html.unescape(candidate).strip(')\"\'.,;')
+              for _ in range(3):
+                  candidate = unquote(candidate)
+              candidate = candidate.replace('\\/', '/')
+              if candidate.startswith(('http://', 'https://')):
+                  cleaned.add(candidate)
+
+          (output / 'candidate_urls.txt').write_text('\n'.join(sorted(cleaned)), encoding='utf-8')
+          (output / 'fetch_log.json').write_text(json.dumps(fetch_log, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          markers = ('pdf', 'attach', 'download', 'blogfiles', 'blogattach', 'postfiles', 'mfiles', 'pstatic.net')
+          downloads = []
+          seen = set()
+          for candidate in sorted(cleaned):
+              lowered = candidate.lower()
+              if not any(marker in lowered for marker in markers):
+                  continue
+              identity = candidate.split('#', 1)[0]
+              if identity in seen:
+                  continue
+              seen.add(identity)
+              try:
+                  response = session.get(
+                      candidate,
+                      timeout=45,
+                      allow_redirects=True,
+                      stream=True,
+                      headers={'Referer': f'https://blog.naver.com/{blog_id}/{log_no}'},
+                  )
+                  response.raise_for_status()
+                  content_type = response.headers.get('content-type', '').lower()
+                  disposition = response.headers.get('content-disposition', '')
+                  first = next(response.iter_content(chunk_size=65536), b'')
+                  is_pdf = first.startswith(b'%PDF') or 'application/pdf' in content_type
+                  is_attachment = 'attachment' in disposition.lower()
+                  is_image = content_type.startswith('image/') and len(first) > 1024
+                  if not (is_pdf or is_attachment or is_image):
+                      continue
+                  name = None
+                  encoded = re.search(r"filename\\*=UTF-8''([^;]+)", disposition, re.I)
+                  plain = re.search(r'filename=\"?([^\";]+)', disposition, re.I)
+                  if encoded:
+                      name = unquote(encoded.group(1))
+                  elif plain:
+                      name = plain.group(1)
+                  if not name:
+                      name = Path(urlparse(response.url).path).name or f'attachment_{len(downloads)+1}.bin'
+                  if is_pdf and not name.lower().endswith('.pdf'):
+                      name += '.pdf'
+                  extension = {'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp'}.get(content_type.split(';')[0])
+                  if is_image and extension and not Path(name).suffix:
+                      name += extension
+                  safe = re.sub(r'[^0-9A-Za-z가-힣._ -]+', '_', name)[:180]
+                  destination = output / safe
+                  total = len(first)
+                  with destination.open('wb') as fp:
+                      fp.write(first)
+                      for chunk in response.iter_content(chunk_size=65536):
+                          if not chunk:
+                              continue
+                          total += len(chunk)
+                          if total > 250 * 1024 * 1024:
+                              raise RuntimeError('attachment exceeds 250 MiB limit')
+                          fp.write(chunk)
+                  downloads.append({'source': candidate, 'final_url': response.url, 'file': safe, 'bytes': total, 'content_type': content_type})
+              except Exception as exc:
+                  downloads.append({'source': candidate, 'error': repr(exc)})
+
+          (output / 'download_log.json').write_text(json.dumps(downloads, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps({'pages': fetch_log, 'candidate_count': len(cleaned), 'downloads': downloads}, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Extract high-recall visual-change frames
+        shell: bash
+        run: |
+          set -euxo pipefail
+          VIDEO_FILE="$(cat work/video-path.txt)"
+          python tools/extract_video_assets.py "$VIDEO_FILE" out/frames \
+            --sample-fps 2.0 \
+            --phash-threshold 18 \
+            --mad-threshold 0.055 \
+            --periodic-seconds 30 \
+            2>&1 | tee out/diagnostics/frame-extraction.log
+
+      - name: Normalize available caption tracks
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out/transcript
+          python tools/normalize_captions.py out/source out/transcript \
+            2>&1 | tee out/diagnostics/caption-normalization.log
+
+      - name: Speech-recognition fallback when captions are unavailable
+        if: ${{ hashFiles('out/transcript/caption_segments.json') == '' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade faster-whisper
+          VIDEO_FILE="$(cat work/video-path.txt)"
+          ffmpeg -hide_banner -loglevel warning -y -i "$VIDEO_FILE" -vn -ac 1 -ar 16000 work/audio.wav
+          timeout 80m python - <<'PY'
+          from __future__ import annotations
+          import json
+          from pathlib import Path
+          from faster_whisper import WhisperModel
+
+          output = Path('out/transcript')
+          output.mkdir(parents=True, exist_ok=True)
+          model = WhisperModel('base', device='cpu', compute_type='int8', cpu_threads=4)
+          iterator, info = model.transcribe(
+              'work/audio.wav', language='ko', beam_size=3, vad_filter=True,
+              condition_on_previous_text=True,
+          )
+          records = []
+          srt = []
+          def ts(value: float) -> str:
+              ms = int(round(value * 1000))
+              h, rem = divmod(ms, 3_600_000)
+              m, rem = divmod(rem, 60_000)
+              s, ms = divmod(rem, 1000)
+              return f'{h:02d}:{m:02d}:{s:02d},{ms:03d}'
+          for index, segment in enumerate(iterator, 1):
+              text = segment.text.strip()
+              if not text:
+                  continue
+              record = {'start': round(segment.start, 3), 'end': round(segment.end, 3), 'text': text}
+              records.append(record)
+              srt.extend([str(index), f'{ts(segment.start)} --> {ts(segment.end)}', text, ''])
+          (output / 'whisper_segments.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (output / 'whisper_transcript.srt').write_text('\n'.join(srt), encoding='utf-8')
+          (output / 'whisper_plain.txt').write_text('\n'.join(r['text'] for r in records), encoding='utf-8')
+          (output / 'whisper_info.json').write_text(json.dumps({
+              'model': 'base', 'language': info.language,
+              'language_probability': info.language_probability,
+              'segments': len(records),
+          }, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+
+      - name: Build inventories and checksums
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out/diagnostics
+          find out -type f -printf '%P\t%s bytes\n' | sort > out/ASSET_INVENTORY.txt
+          find out -type f -print0 | sort -z | xargs -0 sha256sum > out/SHA256SUMS.txt
+          du -ah out | sort -h | tail -n 100 > out/diagnostics/largest-files.txt
+          cat out/frames/summary.json 2>/dev/null || true
+
+      - name: Upload selected frames and visual index
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lecture-frames-proxy-qg-evpqizm
+          path: |
+            out/frames
+            out/source/ffprobe.json
+            out/source/frontend_fetch_result.json
+            out/ASSET_INVENTORY.txt
+            out/SHA256SUMS.txt
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 1
+
+      - name: Upload transcript, source metadata, official material, and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lecture-text-proxy-qg-evpqizm
+          path: |
+            out/source
+            out/transcript
+            out/official_blog
+            out/diagnostics
+            out/ASSET_INVENTORY.txt
+            out/SHA256SUMS.txt
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 1
