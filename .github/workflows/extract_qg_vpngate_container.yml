@@ -1,0 +1,321 @@
+name: Extract qg lecture inside isolated VPN Gate container
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/extract_qg_vpngate_container.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      VIDEO_ID: qg-_EVPqizM
+      VIDEO_URL: https://www.youtube.com/watch?v=qg-_EVPqizM
+      SOURCE_BRANCH: automation/extract-qg-evpqizm-20260728
+    steps:
+      - name: Check out isolated workflow branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Import visual and caption extraction tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git fetch --depth=1 origin "$SOURCE_BRANCH"
+          mkdir -p tools
+          git show FETCH_HEAD:tools/extract_video_assets.py > tools/extract_video_assets.py
+          git show FETCH_HEAD:tools/normalize_captions.py > tools/normalize_captions.py
+
+      - name: Install host-side media dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg jq fonts-noto-cjk curl ca-certificates
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade pillow imagehash numpy
+          sudo modprobe tun || true
+          test -c /dev/net/tun
+
+      - name: Fetch and rank current VPN Gate OpenVPN profiles
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p vpn_configs out/diagnostics out/source out/transcript work
+          curl -fsSL --retry 5 --retry-delay 3 --max-time 60 \
+            'http://www.vpngate.net/api/iphone/' \
+            -o out/diagnostics/vpngate.csv
+          python - <<'PY'
+          from __future__ import annotations
+          import base64, csv, io, json, re
+          from pathlib import Path
+
+          raw=Path('out/diagnostics/vpngate.csv').read_text(encoding='utf-8-sig',errors='replace')
+          lines=[line for line in raw.splitlines() if line and not line.startswith('*')]
+          reader=csv.DictReader(io.StringIO('\n'.join(lines)))
+          rows=[]
+          priority={'KR':0,'JP':1,'TW':2,'SG':3,'US':4,'CA':5,'DE':6,'NL':7,'GB':8}
+          for row in reader:
+              config=row.get('OpenVPN_ConfigData_Base64') or ''
+              if not config: continue
+              country=(row.get('CountryShort') or '').upper()
+              if country not in priority: continue
+              try:
+                  speed=int(row.get('Speed') or 0)
+                  uptime=int(row.get('Uptime') or 0)
+                  score=int(row.get('Score') or 0)
+                  ping=int(row.get('Ping') or 9999)
+              except ValueError:
+                  continue
+              try:
+                  decoded=base64.b64decode(config).decode('utf-8',errors='replace')
+              except Exception:
+                  continue
+              proto='tcp' if re.search(r'^proto\s+tcp',decoded,re.M|re.I) else 'udp'
+              # Prefer TCP for cloud-runner reliability, then geography, uptime, score and speed.
+              rank=(0 if proto=='tcp' else 1, priority[country], -min(uptime,30*86400000), -score, -speed, ping)
+              rows.append((rank,row,decoded,proto))
+          rows.sort(key=lambda item:item[0])
+          selected=[]
+          for index,(rank,row,decoded,proto) in enumerate(rows[:18],1):
+              # Reduce long hangs and make logs deterministic.
+              decoded += '\nconnect-retry-max 1\nconnect-timeout 20\nresolv-retry 3\nverb 3\n'
+              path=Path('vpn_configs')/f'{index:02d}_{row.get("CountryShort")}_{proto}.ovpn'
+              path.write_text(decoded,encoding='utf-8')
+              selected.append({
+                  'file':str(path),'country':row.get('CountryLong'),'countryShort':row.get('CountryShort'),
+                  'host':row.get('HostName'),'ip':row.get('IP'),'score':row.get('Score'),
+                  'speed':row.get('Speed'),'ping':row.get('Ping'),'uptime':row.get('Uptime'),'proto':proto,
+              })
+          Path('out/diagnostics/vpn_candidates.json').write_text(json.dumps(selected,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(selected,ensure_ascii=False,indent=2))
+          if not selected:
+              raise SystemExit('no usable VPN Gate OpenVPN profiles')
+          PY
+
+      - name: Download the complete lecture inside an isolated VPN container
+        id: vpn_download
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > work/run_vpn_download.sh <<'BASH'
+          #!/usr/bin/env bash
+          set -uo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends openvpn ca-certificates curl ffmpeg python3 python3-pip procps iproute2 jq
+          python3 -m pip install --break-system-packages --upgrade "yt-dlp[default,curl-cffi]"
+          mkdir -p /job/out/source /job/out/diagnostics /job/work
+          success=0
+          for config in /job/vpn_configs/*.ovpn; do
+            name="$(basename "$config" .ovpn)"
+            echo "===== VPN ${name} =====" | tee -a /job/out/diagnostics/vpn-download-attempts.log
+            pkill openvpn 2>/dev/null || true
+            rm -f /tmp/openvpn.log /job/work/lecture.*
+            openvpn --config "$config" --daemon --writepid /tmp/openvpn.pid --log /tmp/openvpn.log
+            connected=0
+            for attempt in $(seq 1 45); do
+              if grep -q 'Initialization Sequence Completed' /tmp/openvpn.log 2>/dev/null; then
+                connected=1
+                break
+              fi
+              if grep -Eq 'AUTH_FAILED|Exiting due to fatal error|Connection timed out|TLS Error' /tmp/openvpn.log 2>/dev/null; then
+                break
+              fi
+              sleep 2
+            done
+            cp /tmp/openvpn.log "/job/out/diagnostics/openvpn-${name}.log" 2>/dev/null || true
+            if [[ "$connected" != 1 ]]; then
+              echo "VPN ${name} did not connect" | tee -a /job/out/diagnostics/vpn-download-attempts.log
+              continue
+            fi
+            curl -4 --max-time 20 -fsS https://www.cloudflare.com/cdn-cgi/trace \
+              > "/job/out/diagnostics/trace-${name}.txt" || true
+            curl -4 --max-time 20 -fsS https://api.ipify.org \
+              > "/job/out/diagnostics/ip-${name}.txt" || true
+            echo >> "/job/out/diagnostics/ip-${name}.txt"
+
+            metadata_ok=0
+            clients=(android_vr web_safari web_embedded tv web)
+            for client in "${clients[@]}"; do
+              echo "metadata client=${client}" | tee -a /job/out/diagnostics/vpn-download-attempts.log
+              if yt-dlp --no-playlist --socket-timeout 35 --retries 5 \
+                --js-runtimes node --remote-components ejs:github \
+                --extractor-args "youtube:player_client=${client}" \
+                --simulate --dump-single-json "$VIDEO_URL" \
+                > "/job/out/source/metadata-${name}-${client}.json" \
+                2>> /job/out/diagnostics/vpn-download-attempts.log; then
+                metadata_ok=1
+                break
+              fi
+            done
+            [[ "$metadata_ok" == 1 ]] || continue
+
+            for client in "${clients[@]}"; do
+              rm -f /job/work/lecture.*
+              echo "download client=${client}" | tee -a /job/out/diagnostics/vpn-download-attempts.log
+              if yt-dlp \
+                --no-playlist --verbose \
+                --js-runtimes node --remote-components ejs:github \
+                --retries 20 --fragment-retries 20 \
+                --retry-sleep 'fragment:exp=1:30' \
+                --socket-timeout 45 --concurrent-fragments 6 --no-part \
+                --extractor-args "youtube:player_client=${client}" \
+                --write-info-json --write-description --write-thumbnail --convert-thumbnails jpg \
+                --write-subs --write-auto-subs --sub-langs 'ko.*,ko,en.*' --sub-format 'json3/vtt/best' \
+                -f 'bv*[height<=480]+ba/b[height<=480]/best[height<=480]/best' \
+                --merge-output-format mkv \
+                -o '/job/work/lecture.%(ext)s' \
+                -P 'subtitle:/job/out/source' -P 'thumbnail:/job/out/source' \
+                -P 'description:/job/out/source' -P 'infojson:/job/out/source' \
+                "$VIDEO_URL" >> /job/out/diagnostics/vpn-download-attempts.log 2>&1; then
+                video="$(find /job/work -maxdepth 1 -type f -name 'lecture.*' ! -name '*.part' ! -name '*.json' | head -n 1)"
+                if [[ -n "$video" && -s "$video" ]]; then
+                  duration="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$video" 2>/dev/null || echo 0)"
+                  if awk "BEGIN{exit !($duration > 10000)}"; then
+                    printf 'vpngate-%s-%s\n' "$name" "$client" > /job/out/source/successful_strategy.txt
+                    success=1
+                    break 2
+                  fi
+                fi
+              fi
+            done
+          done
+          pkill openvpn 2>/dev/null || true
+          [[ "$success" == 1 ]]
+          BASH
+          chmod +x work/run_vpn_download.sh
+          docker run --rm --name qg-vpngate \
+            --cap-add=NET_ADMIN --device=/dev/net/tun \
+            -e VIDEO_URL="$VIDEO_URL" \
+            -v "$PWD:/job" -w /job \
+            ubuntu:24.04 bash /job/work/run_vpn_download.sh
+
+      - name: Validate the complete media file
+        if: ${{ steps.vpn_download.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          VIDEO_FILE="$(find work -maxdepth 1 -type f -name 'lecture.*' ! -name '*.part' ! -name '*.json' | head -n 1)"
+          test -n "$VIDEO_FILE"
+          test -s "$VIDEO_FILE"
+          printf '%s\n' "$VIDEO_FILE" > work/video-path.txt
+          ffprobe -v error -show_format -show_streams -of json "$VIDEO_FILE" > out/source/ffprobe.json
+          python - <<'PY'
+          import json
+          data=json.load(open('out/source/ffprobe.json'))
+          duration=float(data['format'].get('duration') or 0)
+          size=int(data['format'].get('size') or 0)
+          print({'duration':duration,'size':size})
+          if duration < 10000 or size < 15_000_000:
+              raise SystemExit('media validation failed')
+          PY
+
+      - name: Extract high-recall visual states
+        if: ${{ steps.vpn_download.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          VIDEO_FILE="$(cat work/video-path.txt)"
+          python tools/extract_video_assets.py "$VIDEO_FILE" out/frames \
+            --sample-fps 2.0 --phash-threshold 9 --mad-threshold 0.026 --periodic-seconds 30 \
+            2>&1 | tee out/diagnostics/frame-extraction.log
+
+      - name: Normalize downloaded caption tracks
+        if: ${{ steps.vpn_download.outcome == 'success' }}
+        id: captions
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out/combined-captions
+          find out/source -type f \( -iname '*.json3' -o -iname '*.vtt' -o -iname '*.srt' -o -iname '*.xml' \) \
+            -exec cp -f {} out/combined-captions/ \;
+          python tools/normalize_captions.py out/combined-captions out/transcript \
+            2>&1 | tee out/diagnostics/caption-normalization.log
+
+      - name: Transcribe audio when captions are absent
+        if: ${{ steps.vpn_download.outcome == 'success' && steps.captions.outcome != 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade faster-whisper
+          VIDEO_FILE="$(cat work/video-path.txt)"
+          ffmpeg -hide_banner -loglevel warning -y -i "$VIDEO_FILE" -vn -ac 1 -ar 16000 work/audio.wav
+          timeout 110m python - <<'PY'
+          from __future__ import annotations
+          import json
+          from pathlib import Path
+          from faster_whisper import WhisperModel
+          output=Path('out/transcript'); output.mkdir(parents=True,exist_ok=True)
+          model=WhisperModel('base',device='cpu',compute_type='int8',cpu_threads=4)
+          iterator,info=model.transcribe('work/audio.wav',language='ko',beam_size=3,vad_filter=True,condition_on_previous_text=True)
+          records=[]; srt=[]
+          def ts(v):
+              ms=int(round(v*1000)); h,r=divmod(ms,3600000); m,r=divmod(r,60000); s,ms=divmod(r,1000)
+              return f'{h:02d}:{m:02d}:{s:02d},{ms:03d}'
+          for idx,seg in enumerate(iterator,1):
+              text=seg.text.strip()
+              if not text: continue
+              records.append({'start':round(seg.start,3),'end':round(seg.end,3),'text':text})
+              srt += [str(idx),f'{ts(seg.start)} --> {ts(seg.end)}',text,'']
+          (output/'whisper_segments.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (output/'whisper_transcript.srt').write_text('\n'.join(srt),encoding='utf-8')
+          (output/'whisper_plain.txt').write_text('\n'.join(x['text'] for x in records),encoding='utf-8')
+          (output/'whisper_info.json').write_text(json.dumps({'model':'base','language':info.language,'language_probability':info.language_probability,'segments':len(records)},ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+
+      - name: Build evidence inventory and checksums
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          find out -type f -printf '%P\t%s bytes\n' | sort > out/ASSET_INVENTORY.txt
+          find out -type f -print0 | sort -z | xargs -0 sha256sum > out/SHA256SUMS.txt
+          du -ah out | sort -h | tail -n 180 > out/diagnostics/largest-files.txt
+          cat out/source/successful_strategy.txt 2>/dev/null || true
+          cat out/frames/summary.json 2>/dev/null || true
+          cat out/transcript/caption_candidates.json 2>/dev/null || true
+          cat out/transcript/whisper_info.json 2>/dev/null || true
+
+      - name: Upload complete frame corpus
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: qg-complete-frames-vpngate
+          path: |
+            out/frames
+            out/source/ffprobe.json
+            out/source/successful_strategy.txt
+            out/ASSET_INVENTORY.txt
+            out/SHA256SUMS.txt
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 2
+
+      - name: Upload transcript, metadata, VPN evidence, and diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: qg-complete-text-vpngate
+          path: |
+            out/source
+            out/transcript
+            out/diagnostics
+            out/ASSET_INVENTORY.txt
+            out/SHA256SUMS.txt
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 2
