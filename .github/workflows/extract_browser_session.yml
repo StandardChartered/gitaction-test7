@@ -1,0 +1,282 @@
+name: Extract lecture with same-IP browser session
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/extract_browser_session.yml'
+      - 'tools/capture_youtube_browser_session.py'
+      - 'tools/normalize_captions.py'
+      - 'tools/extract_video_assets.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      VIDEO_ID: qg-_EVPqizM
+      VIDEO_URL: https://www.youtube.com/watch?v=qg-_EVPqizM
+    steps:
+      - name: Check out extraction branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install browser, yt-dlp, and media dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg jq fonts-noto-cjk xvfb xauth
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade \
+            "yt-dlp[default,curl-cffi]" \
+            yt-dlp-getpot-wpc \
+            playwright \
+            pillow imagehash numpy
+          python -m playwright install --with-deps chromium
+          python - <<'PY' > browser-path.txt
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as p:
+              print(p.chromium.executable_path)
+          PY
+          BROWSER="$(cat browser-path.txt)"
+          test -x "$BROWSER"
+          "$BROWSER" --version
+          yt-dlp --version
+          yt-dlp -v --simulate --extractor-args "youtubepot-wpc:browser_path=$BROWSER" "$VIDEO_URL" \
+            > plugin-check.log 2>&1 || true
+          grep -E "PO Token Providers|wpc" plugin-check.log || true
+
+      - name: Create anonymous same-IP browser session and capture player traffic
+        id: browser_session
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out/browser out/diagnostics work
+          xvfb-run -a python tools/capture_youtube_browser_session.py \
+            --video-id "$VIDEO_ID" \
+            --output out/browser \
+            2>&1 | tee out/diagnostics/browser-session.log
+          cat out/browser/session_summary.json || true
+
+      - name: Download lecture using captured guest cookies and browser-minted PO tokens
+        id: download
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p work out/source out/diagnostics
+          BROWSER="$(cat browser-path.txt)"
+          COOKIE_FILE="out/browser/youtube_cookies.txt"
+          VISITOR="$(cat out/browser/visitor_data.txt 2>/dev/null || true)"
+          : > out/diagnostics/browser-cookie-download-attempts.log
+          success=0
+
+          run_attempt() {
+            local label="$1"
+            local client="$2"
+            local skip="$3"
+            rm -f work/lecture.*
+            local youtube_args="player_client=${client};fetch_pot=always"
+            if [[ -n "$VISITOR" ]]; then
+              youtube_args="${youtube_args};visitor_data=${VISITOR}"
+            fi
+            if [[ "$skip" == "yes" ]]; then
+              youtube_args="${youtube_args};player_skip=webpage,configs"
+            fi
+            echo "===== ${label}: client=${client} skip=${skip} visitor=$([[ -n "$VISITOR" ]] && echo yes || echo no) =====" \
+              | tee -a out/diagnostics/browser-cookie-download-attempts.log
+            local cookies=()
+            if [[ -s "$COOKIE_FILE" ]]; then
+              cookies=(--cookies "$COOKIE_FILE")
+            fi
+            xvfb-run -a yt-dlp \
+              --no-playlist \
+              --verbose \
+              --js-runtimes node \
+              --remote-components ejs:github \
+              --impersonate chrome \
+              --retries 15 \
+              --fragment-retries 15 \
+              --retry-sleep 'fragment:exp=1:25' \
+              --socket-timeout 45 \
+              --concurrent-fragments 4 \
+              --no-part \
+              "${cookies[@]}" \
+              --extractor-args "youtube:${youtube_args}" \
+              --extractor-args "youtubepot-wpc:browser_path=${BROWSER}" \
+              --write-info-json --write-description --write-thumbnail --convert-thumbnails jpg \
+              --write-subs --write-auto-subs --sub-langs 'ko.*,ko,en.*' --sub-format 'json3/vtt/best' \
+              -f 'bv*[height<=720]+ba/b[height<=720]/best' \
+              --merge-output-format mkv \
+              -o 'work/lecture.%(ext)s' \
+              -P 'subtitle:out/source' \
+              -P 'thumbnail:out/source' \
+              -P 'description:out/source' \
+              -P 'infojson:out/source' \
+              "$VIDEO_URL" \
+              >> out/diagnostics/browser-cookie-download-attempts.log 2>&1
+          }
+
+          attempts=(
+            'web-safari-guest|web_safari|no'
+            'mweb-guest-skip|mweb|yes'
+            'web-guest-skip|web|yes'
+            'web-embedded-guest|web_embedded|no'
+            'tv-guest|tv|no'
+            'android-vr-guest|android_vr|no'
+          )
+          for attempt in "${attempts[@]}"; do
+            IFS='|' read -r label client skip <<< "$attempt"
+            if run_attempt "$label" "$client" "$skip"; then
+              success=1
+              printf '%s\n' "$label" > out/source/successful_strategy.txt
+              break
+            fi
+          done
+
+          if [[ "$success" == 1 ]]; then
+            VIDEO_FILE="$(find work -maxdepth 1 -type f -name 'lecture.*' ! -name '*.json' ! -name '*.part' | head -n 1)"
+            test -n "$VIDEO_FILE"
+            printf '%s\n' "$VIDEO_FILE" > work/video-path.txt
+            ffprobe -v error -show_format -show_streams -of json "$VIDEO_FILE" > out/source/ffprobe.json
+            ls -lh "$VIDEO_FILE" | tee out/diagnostics/video-file.txt
+          else
+            echo 'No browser-session yt-dlp strategy produced a video.' >&2
+            exit 1
+          fi
+
+      - name: Extract visually distinct frames from the complete lecture
+        if: ${{ always() }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [[ ! -s work/video-path.txt ]]; then
+            echo 'No downloaded video; frame extraction skipped.'
+            exit 0
+          fi
+          VIDEO_FILE="$(cat work/video-path.txt)"
+          python tools/extract_video_assets.py "$VIDEO_FILE" out/frames \
+            --sample-fps 2.0 \
+            --phash-threshold 18 \
+            --mad-threshold 0.055 \
+            --periodic-seconds 30 \
+            2>&1 | tee out/diagnostics/frame-extraction.log
+
+      - name: Normalize captured and downloaded caption tracks
+        if: ${{ always() }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out/transcript out/combined-captions
+          find out/source out/browser -type f \
+            \( -iname '*.json3' -o -iname '*.vtt' -o -iname '*.srt' -o -iname '*.xml' \) \
+            -exec cp -f {} out/combined-captions/ \; 2>/dev/null || true
+          python tools/normalize_captions.py out/combined-captions out/transcript \
+            2>&1 | tee out/diagnostics/caption-normalization.log
+
+      - name: Speech-recognition fallback when no caption track exists
+        if: ${{ always() }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [[ -s out/transcript/caption_segments.json || ! -s work/video-path.txt ]]; then
+            echo 'Caption track exists or video is unavailable; speech fallback not needed.'
+            exit 0
+          fi
+          python -m pip install --upgrade faster-whisper
+          VIDEO_FILE="$(cat work/video-path.txt)"
+          ffmpeg -hide_banner -loglevel warning -y -i "$VIDEO_FILE" -vn -ac 1 -ar 16000 work/audio.wav
+          timeout 80m python - <<'PY'
+          from __future__ import annotations
+          import json
+          from pathlib import Path
+          from faster_whisper import WhisperModel
+
+          output = Path('out/transcript')
+          output.mkdir(parents=True, exist_ok=True)
+          model = WhisperModel('base', device='cpu', compute_type='int8', cpu_threads=4)
+          iterator, info = model.transcribe(
+              'work/audio.wav', language='ko', beam_size=3,
+              vad_filter=True, condition_on_previous_text=True,
+          )
+          records = []
+          srt = []
+          def ts(value: float) -> str:
+              ms = int(round(value * 1000))
+              h, rem = divmod(ms, 3_600_000)
+              m, rem = divmod(rem, 60_000)
+              s, ms = divmod(rem, 1000)
+              return f'{h:02d}:{m:02d}:{s:02d},{ms:03d}'
+          for index, segment in enumerate(iterator, 1):
+              text = segment.text.strip()
+              if not text:
+                  continue
+              record = {'start': round(segment.start, 3), 'end': round(segment.end, 3), 'text': text}
+              records.append(record)
+              srt.extend([str(index), f'{ts(segment.start)} --> {ts(segment.end)}', text, ''])
+          (output / 'whisper_segments.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (output / 'whisper_transcript.srt').write_text('\n'.join(srt), encoding='utf-8')
+          (output / 'whisper_plain.txt').write_text('\n'.join(r['text'] for r in records), encoding='utf-8')
+          (output / 'whisper_info.json').write_text(json.dumps({
+              'model': 'base', 'language': info.language,
+              'language_probability': info.language_probability,
+              'segments': len(records),
+          }, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+
+      - name: Build inventories and checksums
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out/diagnostics
+          cp -f plugin-check.log out/diagnostics/ 2>/dev/null || true
+          find out -type f -printf '%P\t%s bytes\n' | sort > out/ASSET_INVENTORY.txt
+          find out -type f -print0 | sort -z | xargs -0 sha256sum > out/SHA256SUMS.txt
+          du -ah out | sort -h | tail -n 120 > out/diagnostics/largest-files.txt
+          cat out/browser/session_summary.json 2>/dev/null || true
+          cat out/frames/summary.json 2>/dev/null || true
+
+      - name: Upload browser session evidence and source text
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: lecture-browser-session-qg-evpqizm
+          path: |
+            out/browser
+            out/source
+            out/transcript
+            out/diagnostics
+            out/ASSET_INVENTORY.txt
+            out/SHA256SUMS.txt
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 1
+
+      - name: Upload complete visual frame corpus
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: lecture-browser-frames-qg-evpqizm
+          path: |
+            out/frames
+            out/source/ffprobe.json
+            out/source/successful_strategy.txt
+            out/ASSET_INVENTORY.txt
+            out/SHA256SUMS.txt
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 1

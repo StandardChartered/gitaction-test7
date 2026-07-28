@@ -1,17 +1,448 @@
-name: Hello World2
+name: Extract YouTube lecture study assets
 
-# Controls when the workflow will run
-on: [push]
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/github_checkout.yml'
+      - 'tools/extract_video_assets.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  extract:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      VIDEO_ID: qg-_EVPqizM
+      VIDEO_URL: https://www.youtube.com/watch?v=qg-_EVPqizM
+      BLOG_ID: gongbupig
+      BLOG_LOG_NO: '223836639345'
+    steps:
+      - name: Check out extraction branch
+        uses: actions/checkout@v4
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
-    steps:    
-     - uses: actions/checkout@v2    
-     - name: Run pwd      
-       run: pwd    
-     - name: Run ls -al      
-       run: ls -al
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install media and extraction dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg jq fonts-noto-cjk
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade "yt-dlp[default,curl-cffi]" pillow imagehash numpy requests beautifulsoup4 lxml
+          yt-dlp --version
+          ffmpeg -version | head -n 3
+          node --version
+
+      - name: Collect metadata, description, thumbnail, and captions
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p out/source out/diagnostics work
+          COMMON=(
+            --no-playlist
+            --js-runtimes node
+            --remote-components ejs:github
+            --impersonate chrome
+            --retries 12
+            --fragment-retries 12
+            --retry-sleep 'fragment:exp=1:20'
+            --socket-timeout 30
+          )
+          CLIENTS=(web_embedded android_vr web_safari)
+
+          : > out/diagnostics/metadata-attempts.log
+          for client in "${CLIENTS[@]}"; do
+            echo "metadata client=${client}" | tee -a out/diagnostics/metadata-attempts.log
+            if yt-dlp "${COMMON[@]}" \
+              --extractor-args "youtube:player_client=${client}" \
+              --dump-single-json "$VIDEO_URL" > out/source/video_info.json.tmp \
+              2>> out/diagnostics/metadata-attempts.log; then
+              mv out/source/video_info.json.tmp out/source/video_info.json
+              break
+            fi
+          done
+          rm -f out/source/video_info.json.tmp
+
+          : > out/diagnostics/source-files-attempts.log
+          for client in "${CLIENTS[@]}"; do
+            echo "source files client=${client}" | tee -a out/diagnostics/source-files-attempts.log
+            yt-dlp "${COMMON[@]}" \
+              --extractor-args "youtube:player_client=${client}" \
+              --skip-download \
+              --write-description --write-info-json --write-thumbnail \
+              --convert-thumbnails jpg \
+              -o 'out/source/%(id)s.%(ext)s' "$VIDEO_URL" \
+              >> out/diagnostics/source-files-attempts.log 2>&1 && break
+          done
+
+          : > out/diagnostics/subtitle-attempts.log
+          for subformat in json3 vtt; do
+            for client in "${CLIENTS[@]}"; do
+              echo "subtitle format=${subformat} client=${client}" | tee -a out/diagnostics/subtitle-attempts.log
+              yt-dlp "${COMMON[@]}" \
+                --extractor-args "youtube:player_client=${client}" \
+                --skip-download --write-subs --write-auto-subs \
+                --sub-langs 'ko.*,ko,en.*' --sub-format "$subformat" \
+                -o 'out/source/%(id)s.%(ext)s' "$VIDEO_URL" \
+                >> out/diagnostics/subtitle-attempts.log 2>&1 || true
+              if find out/source -maxdepth 1 -type f -name "*.${subformat}" | grep -q .; then
+                break
+              fi
+            done
+          done
+
+          find out/source -maxdepth 1 -type f -printf '%f\n' | sort > out/diagnostics/source-file-list.txt
+
+      - name: Download a study-resolution copy of the lecture
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p work out/diagnostics
+          COMMON=(
+            --no-playlist
+            --js-runtimes node
+            --remote-components ejs:github
+            --impersonate chrome
+            --retries 15
+            --fragment-retries 15
+            --retry-sleep 'fragment:exp=1:25'
+            --socket-timeout 30
+            --concurrent-fragments 4
+            --merge-output-format mp4
+            --no-part
+          )
+          CLIENTS=(web_embedded web_safari android_vr)
+          : > out/diagnostics/video-download-attempts.log
+          success=0
+          for client in "${CLIENTS[@]}"; do
+            rm -f work/lecture.*
+            echo "video client=${client}" | tee -a out/diagnostics/video-download-attempts.log
+            if yt-dlp "${COMMON[@]}" \
+              --extractor-args "youtube:player_client=${client}" \
+              -f 'b[height<=720]/bv*[height<=720]+ba/bv*[height<=720]/b/bv*+ba/bv*' \
+              -o 'work/lecture.%(ext)s' "$VIDEO_URL" \
+              >> out/diagnostics/video-download-attempts.log 2>&1; then
+              success=1
+              break
+            fi
+          done
+          if [[ "$success" != 1 ]]; then
+            echo 'All yt-dlp video download strategies failed.' >&2
+            exit 1
+          fi
+          VIDEO_FILE="$(find work -maxdepth 1 -type f -name 'lecture.*' ! -name '*.json' ! -name '*.part' | head -n 1)"
+          if [[ -z "$VIDEO_FILE" ]]; then
+            echo 'yt-dlp reported success but no video file was produced.' >&2
+            exit 1
+          fi
+          printf '%s\n' "$VIDEO_FILE" > work/video-path.txt
+          ffprobe -v error -show_format -show_streams -of json "$VIDEO_FILE" > out/source/ffprobe.json
+          ls -lh "$VIDEO_FILE" | tee out/diagnostics/video-file.txt
+
+      - name: Fetch the creator's linked Naver post and public attachments
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import html
+          import json
+          import os
+          import re
+          from pathlib import Path
+          from urllib.parse import unquote, urljoin, urlparse
+          import requests
+          from bs4 import BeautifulSoup
+
+          blog_id = os.environ['BLOG_ID']
+          log_no = os.environ['BLOG_LOG_NO']
+          output = Path('out/official_blog')
+          output.mkdir(parents=True, exist_ok=True)
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                            '(KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+              'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.6,en;q=0.5',
+          })
+          pages = [
+              f'https://blog.naver.com/{blog_id}/{log_no}',
+              f'https://blog.naver.com/PostView.naver?blogId={blog_id}&logNo={log_no}',
+              f'https://m.blog.naver.com/PostView.naver?blogId={blog_id}&logNo={log_no}',
+              f'https://rss.blog.naver.com/{blog_id}.xml',
+          ]
+          candidates: set[str] = set()
+          fetch_log = []
+          url_pattern = re.compile(r'https?:\\?/\\?/[^\"\'<>\\s]+', re.I)
+
+          for index, url in enumerate(pages, 1):
+              try:
+                  response = session.get(url, timeout=35, allow_redirects=True)
+                  response.raise_for_status()
+                  suffix = '.xml' if 'rss.' in url else '.html'
+                  path = output / f'page_{index}{suffix}'
+                  path.write_bytes(response.content)
+                  text = response.text
+                  decoded = html.unescape(text).replace('\\u0026', '&').replace('\\/', '/')
+                  soup = BeautifulSoup(text, 'lxml')
+                  for tag in soup.find_all(True):
+                      for key in ('href', 'src', 'data-src', 'data-link', 'data-url'):
+                          value = tag.get(key)
+                          if value:
+                              candidates.add(urljoin(response.url, html.unescape(value)))
+                  for match in url_pattern.findall(decoded):
+                      candidates.add(match.replace('\\/', '/'))
+                  fetch_log.append({'url': url, 'status': response.status_code, 'final_url': response.url, 'bytes': len(response.content)})
+              except Exception as exc:
+                  fetch_log.append({'url': url, 'error': repr(exc)})
+
+          cleaned: set[str] = set()
+          for candidate in candidates:
+              candidate = html.unescape(candidate).strip(')\"\'.,;')
+              candidate = unquote(candidate)
+              if candidate.startswith(('http://', 'https://')):
+                  cleaned.add(candidate)
+
+          (output / 'candidate_urls.txt').write_text('\n'.join(sorted(cleaned)), encoding='utf-8')
+          (output / 'fetch_log.json').write_text(json.dumps(fetch_log, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          attachment_markers = ('pdf', 'attach', 'download', 'blogfiles', 'blogattach', 'postfiles', 'mfiles')
+          downloads = []
+          seen_hashless = set()
+          for candidate in sorted(cleaned):
+              lowered = candidate.lower()
+              if not any(marker in lowered for marker in attachment_markers):
+                  continue
+              identity = candidate.split('#', 1)[0]
+              if identity in seen_hashless:
+                  continue
+              seen_hashless.add(identity)
+              try:
+                  response = session.get(candidate, timeout=45, allow_redirects=True, stream=True,
+                                         headers={'Referer': f'https://blog.naver.com/{blog_id}/{log_no}'})
+                  response.raise_for_status()
+                  content_type = response.headers.get('content-type', '').lower()
+                  content_disposition = response.headers.get('content-disposition', '')
+                  first = next(response.iter_content(chunk_size=65536), b'')
+                  is_pdf = first.startswith(b'%PDF') or 'application/pdf' in content_type
+                  is_attachment = 'attachment' in content_disposition.lower()
+                  if not (is_pdf or is_attachment):
+                      continue
+                  name = None
+                  encoded_name = re.search(r"filename\\*=UTF-8''([^;]+)", content_disposition, re.I)
+                  plain_name = re.search(r'filename=\"?([^\";]+)', content_disposition, re.I)
+                  if encoded_name:
+                      name = unquote(encoded_name.group(1))
+                  elif plain_name:
+                      name = plain_name.group(1)
+                  if not name:
+                      name = Path(urlparse(response.url).path).name or f'attachment_{len(downloads)+1}.bin'
+                  if is_pdf and not name.lower().endswith('.pdf'):
+                      name += '.pdf'
+                  safe = re.sub(r'[^0-9A-Za-z가-힣._ -]+', '_', name)[:180]
+                  destination = output / safe
+                  total = len(first)
+                  with destination.open('wb') as fp:
+                      fp.write(first)
+                      for chunk in response.iter_content(chunk_size=65536):
+                          if not chunk:
+                              continue
+                          total += len(chunk)
+                          if total > 200 * 1024 * 1024:
+                              raise RuntimeError('attachment exceeds 200 MiB limit')
+                          fp.write(chunk)
+                  downloads.append({'source': candidate, 'final_url': response.url, 'file': safe, 'bytes': total, 'content_type': content_type})
+              except Exception as exc:
+                  downloads.append({'source': candidate, 'error': repr(exc)})
+
+          (output / 'download_log.json').write_text(json.dumps(downloads, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps({'pages': fetch_log, 'candidate_count': len(cleaned), 'downloads': downloads}, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Extract high-recall visual-change frames
+        shell: bash
+        run: |
+          set -euxo pipefail
+          VIDEO_FILE="$(cat work/video-path.txt)"
+          python tools/extract_video_assets.py "$VIDEO_FILE" out/frames \
+            --sample-fps 2.0 \
+            --phash-threshold 9 \
+            --mad-threshold 0.026 \
+            --periodic-seconds 40
+
+      - name: Normalize downloaded captions into timestamped transcript files
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import json
+          import re
+          from pathlib import Path
+
+          source = Path('out/source')
+          output = Path('out/transcript')
+          output.mkdir(parents=True, exist_ok=True)
+          segments = []
+
+          json3_files = sorted(source.glob('*.json3'))
+          if json3_files:
+              chosen = next((p for p in json3_files if '.ko' in p.name.lower()), json3_files[0])
+              data = json.loads(chosen.read_text(encoding='utf-8'))
+              for event in data.get('events', []):
+                  text = ''.join(seg.get('utf8', '') for seg in event.get('segs', []))
+                  text = re.sub(r'\s+', ' ', text).strip()
+                  if not text:
+                      continue
+                  start = event.get('tStartMs', 0) / 1000.0
+                  duration = event.get('dDurationMs', 0) / 1000.0
+                  segments.append({'start': start, 'end': start + duration, 'text': text})
+              (output / 'source_caption_file.txt').write_text(chosen.name, encoding='utf-8')
+          else:
+              vtt_files = sorted(source.glob('*.vtt'))
+              if vtt_files:
+                  chosen = next((p for p in vtt_files if '.ko' in p.name.lower()), vtt_files[0])
+                  timestamp = re.compile(r'(\d{2}:)?\d{2}:\d{2}\.\d{3}\s+-->\s+(\d{2}:)?\d{2}:\d{2}\.\d{3}')
+                  current = None
+                  text_parts = []
+                  def seconds(value: str) -> float:
+                      pieces = value.split(':')
+                      if len(pieces) == 2:
+                          pieces.insert(0, '0')
+                      h, m, s = pieces
+                      return int(h) * 3600 + int(m) * 60 + float(s)
+                  def flush():
+                      nonlocal current, text_parts
+                      if current and text_parts:
+                          text = re.sub(r'<[^>]+>', '', ' '.join(text_parts))
+                          text = re.sub(r'\s+', ' ', text).strip()
+                          if text:
+                              segments.append({'start': current[0], 'end': current[1], 'text': text})
+                      current = None
+                      text_parts = []
+                  for line in chosen.read_text(encoding='utf-8-sig', errors='replace').splitlines():
+                      match = timestamp.search(line)
+                      if match:
+                          flush()
+                          left, right = [part.strip() for part in line.split('-->', 1)]
+                          current = (seconds(left), seconds(right.split()[0]))
+                      elif current and line.strip() and not line.strip().isdigit():
+                          text_parts.append(line.strip())
+                      elif not line.strip():
+                          flush()
+                  flush()
+                  (output / 'source_caption_file.txt').write_text(chosen.name, encoding='utf-8')
+
+          if segments:
+              # Remove exact consecutive duplicates common in auto-caption VTT output.
+              deduped = []
+              for segment in segments:
+                  if deduped and segment['text'] == deduped[-1]['text']:
+                      deduped[-1]['end'] = max(deduped[-1]['end'], segment['end'])
+                  else:
+                      deduped.append(segment)
+              segments = deduped
+              (output / 'caption_segments.json').write_text(json.dumps(segments, ensure_ascii=False, indent=2), encoding='utf-8')
+              lines = [f"[{s['start']:09.3f} - {s['end']:09.3f}] {s['text']}" for s in segments]
+              (output / 'caption_transcript.txt').write_text('\n'.join(lines), encoding='utf-8')
+              (output / 'caption_plain.txt').write_text('\n'.join(s['text'] for s in segments), encoding='utf-8')
+              print(f'normalized {len(segments)} caption segments')
+          else:
+              (output / 'NO_CAPTIONS_FOUND.txt').write_text('No downloadable subtitle track was found; workflow will try speech recognition.', encoding='utf-8')
+              print('no caption tracks found')
+          PY
+
+      - name: Speech-recognition fallback when no caption track is available
+        if: ${{ hashFiles('out/transcript/caption_segments.json') == '' }}
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade faster-whisper
+          VIDEO_FILE="$(cat work/video-path.txt)"
+          ffmpeg -hide_banner -loglevel warning -y -i "$VIDEO_FILE" -vn -ac 1 -ar 16000 work/audio.wav
+          timeout 85m python - <<'PY'
+          from __future__ import annotations
+          import json
+          from pathlib import Path
+          from faster_whisper import WhisperModel
+
+          output = Path('out/transcript')
+          output.mkdir(parents=True, exist_ok=True)
+          model = WhisperModel('base', device='cpu', compute_type='int8', cpu_threads=4)
+          iterator, info = model.transcribe(
+              'work/audio.wav',
+              language='ko',
+              beam_size=3,
+              vad_filter=True,
+              condition_on_previous_text=True,
+          )
+          records = []
+          srt = []
+          def ts(value: float) -> str:
+              ms = int(round(value * 1000))
+              h, rem = divmod(ms, 3_600_000)
+              m, rem = divmod(rem, 60_000)
+              s, ms = divmod(rem, 1000)
+              return f'{h:02d}:{m:02d}:{s:02d},{ms:03d}'
+          for index, segment in enumerate(iterator, 1):
+              text = segment.text.strip()
+              if not text:
+                  continue
+              record = {'start': segment.start, 'end': segment.end, 'text': text}
+              records.append(record)
+              srt.extend([str(index), f'{ts(segment.start)} --> {ts(segment.end)}', text, ''])
+          (output / 'whisper_segments.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (output / 'whisper_transcript.srt').write_text('\n'.join(srt), encoding='utf-8')
+          (output / 'whisper_plain.txt').write_text('\n'.join(r['text'] for r in records), encoding='utf-8')
+          (output / 'whisper_info.json').write_text(json.dumps({'language': info.language, 'language_probability': info.language_probability, 'segments': len(records)}, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+
+      - name: Build asset inventory and checksums
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out/diagnostics
+          find out -type f -printf '%P\t%s bytes\n' | sort > out/ASSET_INVENTORY.txt
+          find out -type f -print0 | sort -z | xargs -0 sha256sum > out/SHA256SUMS.txt
+          du -ah out | sort -h | tail -n 80 > out/diagnostics/largest-files.txt
+
+      - name: Upload visual frame corpus
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lecture-frames-qg-evpqizm
+          path: |
+            out/frames
+            out/source/*.jpg
+            out/source/ffprobe.json
+            out/ASSET_INVENTORY.txt
+            out/SHA256SUMS.txt
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 1
+
+      - name: Upload metadata, transcript, blog source, and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lecture-text-qg-evpqizm
+          path: |
+            out/source
+            !out/source/*.jpg
+            out/transcript
+            out/official_blog
+            out/diagnostics
+            out/ASSET_INVENTORY.txt
+            out/SHA256SUMS.txt
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 1

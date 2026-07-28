@@ -1,0 +1,232 @@
+name: Extract lecture with PO token provider
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/extract_pot.yml'
+      - 'tools/normalize_captions.py'
+      - 'tools/extract_video_assets.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      VIDEO_ID: qg-_EVPqizM
+      VIDEO_URL: https://www.youtube.com/watch?v=qg-_EVPqizM
+    steps:
+      - name: Check out extraction branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install yt-dlp, PO-token plugin, and media dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg jq fonts-noto-cjk netcat-openbsd
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade \
+            "yt-dlp[default,curl-cffi]" \
+            bgutil-ytdlp-pot-provider \
+            pillow imagehash numpy
+          yt-dlp --version
+          python -m pip show bgutil-ytdlp-pot-provider
+          node --version
+          docker --version
+
+      - name: Start local BgUtils proof-of-origin token provider
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull brainicism/bgutil-ytdlp-pot-provider:latest
+          docker run --name bgutil-provider --detach --init --publish 4416:4416 \
+            brainicism/bgutil-ytdlp-pot-provider:latest
+          for attempt in $(seq 1 45); do
+            if nc -z 127.0.0.1 4416; then
+              break
+            fi
+            sleep 2
+          done
+          nc -z 127.0.0.1 4416
+          docker ps --filter name=bgutil-provider
+          docker logs bgutil-provider | tee bgutil-startup.log || true
+
+      - name: Retrieve lecture, source metadata, thumbnail, and captions
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p work out/source out/diagnostics
+          COMMON=(
+            --no-playlist
+            --verbose
+            --js-runtimes node
+            --remote-components ejs:github
+            --impersonate chrome
+            --retries 15
+            --fragment-retries 15
+            --retry-sleep 'fragment:exp=1:25'
+            --socket-timeout 45
+            --concurrent-fragments 4
+            --no-part
+            --write-info-json
+            --write-description
+            --write-thumbnail
+            --convert-thumbnails jpg
+            --write-subs
+            --write-auto-subs
+            --sub-langs 'ko.*,ko,en.*'
+            --sub-format 'json3/vtt/best'
+          )
+          CLIENTS=(mweb web_safari web_embedded android_vr)
+          : > out/diagnostics/pot-download-attempts.log
+          success=0
+          for client in "${CLIENTS[@]}"; do
+            rm -f work/lecture.*
+            echo "client=${client}" | tee -a out/diagnostics/pot-download-attempts.log
+            if yt-dlp "${COMMON[@]}" \
+              --extractor-args "youtube:player_client=${client}" \
+              -f 'bv*[height<=720]+ba/b[height<=720]/best' \
+              --merge-output-format mkv \
+              -o 'work/lecture.%(ext)s' \
+              -P 'subtitle:out/source' \
+              -P 'thumbnail:out/source' \
+              -P 'description:out/source' \
+              -P 'infojson:out/source' \
+              "$VIDEO_URL" \
+              >> out/diagnostics/pot-download-attempts.log 2>&1; then
+              success=1
+              printf '%s\n' "$client" > out/source/successful_player_client.txt
+              break
+            fi
+          done
+          docker logs bgutil-provider > out/diagnostics/bgutil-provider.log 2>&1 || true
+          if [[ "$success" != 1 ]]; then
+            echo 'All PO-token yt-dlp strategies failed.' >&2
+            exit 1
+          fi
+          VIDEO_FILE="$(find work -maxdepth 1 -type f -name 'lecture.*' ! -name '*.json' ! -name '*.part' | head -n 1)"
+          test -n "$VIDEO_FILE"
+          printf '%s\n' "$VIDEO_FILE" > work/video-path.txt
+          ffprobe -v error -show_format -show_streams -of json "$VIDEO_FILE" > out/source/ffprobe.json
+          ls -lh "$VIDEO_FILE" | tee out/diagnostics/video-file.txt
+          find out/source -maxdepth 1 -type f -printf '%f\t%s bytes\n' | sort > out/diagnostics/source-files.txt
+
+      - name: Extract visually distinct lecture frames
+        shell: bash
+        run: |
+          set -euxo pipefail
+          VIDEO_FILE="$(cat work/video-path.txt)"
+          python tools/extract_video_assets.py "$VIDEO_FILE" out/frames \
+            --sample-fps 2.0 \
+            --phash-threshold 18 \
+            --mad-threshold 0.055 \
+            --periodic-seconds 30 \
+            2>&1 | tee out/diagnostics/frame-extraction.log
+
+      - name: Normalize caption tracks
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out/transcript
+          python tools/normalize_captions.py out/source out/transcript \
+            2>&1 | tee out/diagnostics/caption-normalization.log
+
+      - name: Speech-recognition fallback when captions are unavailable
+        if: ${{ hashFiles('out/transcript/caption_segments.json') == '' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade faster-whisper
+          VIDEO_FILE="$(cat work/video-path.txt)"
+          ffmpeg -hide_banner -loglevel warning -y -i "$VIDEO_FILE" -vn -ac 1 -ar 16000 work/audio.wav
+          timeout 80m python - <<'PY'
+          from __future__ import annotations
+          import json
+          from pathlib import Path
+          from faster_whisper import WhisperModel
+
+          output = Path('out/transcript')
+          output.mkdir(parents=True, exist_ok=True)
+          model = WhisperModel('base', device='cpu', compute_type='int8', cpu_threads=4)
+          iterator, info = model.transcribe(
+              'work/audio.wav', language='ko', beam_size=3,
+              vad_filter=True, condition_on_previous_text=True,
+          )
+          records = []
+          srt = []
+          def ts(value: float) -> str:
+              ms = int(round(value * 1000))
+              h, rem = divmod(ms, 3_600_000)
+              m, rem = divmod(rem, 60_000)
+              s, ms = divmod(rem, 1000)
+              return f'{h:02d}:{m:02d}:{s:02d},{ms:03d}'
+          for index, segment in enumerate(iterator, 1):
+              text = segment.text.strip()
+              if not text:
+                  continue
+              record = {'start': round(segment.start, 3), 'end': round(segment.end, 3), 'text': text}
+              records.append(record)
+              srt.extend([str(index), f'{ts(segment.start)} --> {ts(segment.end)}', text, ''])
+          (output / 'whisper_segments.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (output / 'whisper_transcript.srt').write_text('\n'.join(srt), encoding='utf-8')
+          (output / 'whisper_plain.txt').write_text('\n'.join(r['text'] for r in records), encoding='utf-8')
+          (output / 'whisper_info.json').write_text(json.dumps({
+              'model': 'base', 'language': info.language,
+              'language_probability': info.language_probability,
+              'segments': len(records),
+          }, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+
+      - name: Build inventories and checksums
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out/diagnostics
+          docker logs bgutil-provider > out/diagnostics/bgutil-provider-final.log 2>&1 || true
+          find out -type f -printf '%P\t%s bytes\n' | sort > out/ASSET_INVENTORY.txt
+          find out -type f -print0 | sort -z | xargs -0 sha256sum > out/SHA256SUMS.txt
+          du -ah out | sort -h | tail -n 100 > out/diagnostics/largest-files.txt
+          cat out/frames/summary.json 2>/dev/null || true
+
+      - name: Upload selected frames and visual index
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lecture-frames-pot-qg-evpqizm
+          path: |
+            out/frames
+            out/source/ffprobe.json
+            out/source/successful_player_client.txt
+            out/ASSET_INVENTORY.txt
+            out/SHA256SUMS.txt
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 1
+
+      - name: Upload transcript, source metadata, and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lecture-text-pot-qg-evpqizm
+          path: |
+            out/source
+            out/transcript
+            out/diagnostics
+            out/ASSET_INVENTORY.txt
+            out/SHA256SUMS.txt
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 1
