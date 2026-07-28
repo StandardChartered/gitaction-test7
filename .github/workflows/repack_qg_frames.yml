@@ -1,0 +1,170 @@
+name: Repack qg lecture frames for final document
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/repack_qg_frames.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  repack:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out isolated workflow branch
+        uses: actions/checkout@v4
+
+      - name: Download complete source frame artifact from successful extraction run
+        uses: actions/download-artifact@v4
+        with:
+          name: qg-complete-frames-warp-proxy
+          path: source_artifact
+          github-token: ${{ github.token }}
+          repository: StandardChartered/gitaction-test7
+          run-id: '30347621488'
+
+      - name: Install image processing dependency
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pillow
+
+      - name: Select five-second coverage frames and major visual transitions
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import csv
+          import json
+          import math
+          from bisect import bisect_left
+          from pathlib import Path
+          from PIL import Image, ImageOps
+
+          root = Path('source_artifact')
+          manifest_path = next(root.rglob('manifest.csv'))
+          source_selected = manifest_path.parent / 'selected'
+          output = Path('slim_frames')
+          output_frames = output / 'frames'
+          output_frames.mkdir(parents=True, exist_ok=True)
+
+          records = []
+          with manifest_path.open(encoding='utf-8-sig', newline='') as fp:
+              for row in csv.DictReader(fp):
+                  row['timestamp_seconds'] = float(row['timestamp_seconds'])
+                  row['phash_distance'] = int(float(row['phash_distance']))
+                  row['mean_absolute_difference'] = float(row['mean_absolute_difference'])
+                  records.append(row)
+          if not records:
+              raise SystemExit('empty frame manifest')
+          times = [r['timestamp_seconds'] for r in records]
+
+          def nearest_index(target: float) -> int:
+              i = bisect_left(times, target)
+              if i <= 0:
+                  return 0
+              if i >= len(times):
+                  return len(times) - 1
+              return i if abs(times[i] - target) < abs(times[i-1] - target) else i - 1
+
+          chosen: set[int] = set()
+          duration = times[-1]
+          # Dense temporal coverage: one real video frame every five seconds.
+          for n in range(int(math.floor(duration / 5.0)) + 1):
+              chosen.add(nearest_index(n * 5.0))
+          # Preserve chapter boundaries and nearby title transitions.
+          chapter_starts = [0, 1, 91, 289, 357, 621, 2174, 3090, 4815, 8134, 10421, 11763, 13184]
+          for start in chapter_starts:
+              for offset in (-2, -1, 0, 1, 2, 5, 10):
+                  chosen.add(nearest_index(max(0, start + offset)))
+          # Add unusually large visual changes, with a two-second separation.
+          strong = [
+              i for i, r in enumerate(records)
+              if r['phash_distance'] >= 70 or r['mean_absolute_difference'] >= 0.20
+          ]
+          last = -999.0
+          added = 0
+          for i in strong:
+              t = records[i]['timestamp_seconds']
+              if t - last < 2.0:
+                  continue
+              chosen.add(i)
+              last = t
+              added += 1
+              if added >= 900:
+                  break
+
+          ordered = sorted(chosen, key=lambda i: records[i]['timestamp_seconds'])
+          if len(ordered) > 3800:
+              # Keep all five-second coverage entries and downsample only extras.
+              coverage = {nearest_index(n * 5.0) for n in range(int(math.floor(duration / 5.0)) + 1)}
+              extras = [i for i in ordered if i not in coverage]
+              slots = max(0, 3800 - len(coverage))
+              if slots and len(extras) > slots:
+                  extras = [extras[round(k * (len(extras)-1) / max(1, slots-1))] for k in range(slots)]
+              ordered = sorted(coverage | set(extras), key=lambda i: records[i]['timestamp_seconds'])
+
+          exported = []
+          for number, index in enumerate(ordered, 1):
+              record = records[index]
+              source = source_selected / record['filename']
+              if not source.exists():
+                  raise FileNotFoundError(source)
+              with Image.open(source) as image:
+                  image = ImageOps.exif_transpose(image).convert('RGB')
+                  if image.width > 960:
+                      height = round(image.height * 960 / image.width)
+                      image = image.resize((960, height), Image.Resampling.LANCZOS)
+                  out_name = f"frame_{number:04d}_{record['timestamp'].replace(':','-').replace('.','-')}.jpg"
+                  destination = output_frames / out_name
+                  image.save(destination, 'JPEG', quality=66, optimize=True, progressive=True)
+              exported.append({
+                  'sequence': number,
+                  'timestamp_seconds': round(record['timestamp_seconds'], 3),
+                  'timestamp': record['timestamp'],
+                  'filename': out_name,
+                  'source_filename': record['filename'],
+                  'phash_distance': record['phash_distance'],
+                  'mean_absolute_difference': record['mean_absolute_difference'],
+                  'selection': '5s-coverage' if index in {nearest_index(n * 5.0) for n in range(int(math.floor(duration / 5.0)) + 1)} else 'major-transition',
+              })
+              if number % 300 == 0:
+                  print(f'exported {number}/{len(ordered)}')
+
+          fields = list(exported[0].keys())
+          with (output / 'manifest.csv').open('w', encoding='utf-8-sig', newline='') as fp:
+              writer = csv.DictWriter(fp, fieldnames=fields)
+              writer.writeheader()
+              writer.writerows(exported)
+          (output / 'manifest.json').write_text(json.dumps(exported, ensure_ascii=False, indent=2), encoding='utf-8')
+          summary = {
+              'source_selected_count': len(records),
+              'exported_count': len(exported),
+              'duration_seconds': duration,
+              'coverage_interval_seconds': 5,
+              'max_width': 960,
+              'jpeg_quality': 66,
+              'first_timestamp': exported[0]['timestamp'],
+              'last_timestamp': exported[-1]['timestamp'],
+          }
+          (output / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+          du -sh slim_frames
+          find slim_frames -type f -printf '%P\t%s bytes\n' | sort > slim_frames/INVENTORY.txt
+          find slim_frames -type f -print0 | sort -z | xargs -0 sha256sum > slim_frames/SHA256SUMS.txt
+
+      - name: Upload document-ready visual corpus
+        uses: actions/upload-artifact@v4
+        with:
+          name: qg-document-ready-frames
+          path: slim_frames
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 2
